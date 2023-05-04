@@ -74,6 +74,8 @@ jobs:
       - name: apt stuff
         run: |
           apt -y update
+          apt -y dist-upgrade
+          apt -y install curl zip pkg-config
 
       - name: Install Crossbuild tools
         uses: awalsh128/cache-apt-pkgs-action@latest
