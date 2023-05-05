@@ -58,6 +58,7 @@ static const char *configs[] = {
         NULL,
 };
 
+static void process_on_loop(uv_async_t *async);
 
 static future_t *new_future() {
     future_t *f = calloc(1, sizeof(future_t));
@@ -139,6 +140,7 @@ static void do_shutdown(void *args, future_t *f, uv_loop_t *l);
 
 static uv_once_t init;
 static uv_loop_t *lib_loop;
+static uv_sem_t lib_sem;
 static uv_thread_t lib_thread;
 static uv_key_t err_key;
 static uv_mutex_t q_mut;
@@ -481,6 +483,7 @@ static int connect_socket(ziti_socket_t clt_sock, ziti_socket_t *ziti_sock) {
         ZITI_LOG(WARN, "socketpair failed[%d/%s]", errno, strerror(errno));
         return errno;
     }
+    ZITI_LOG(DEBUG, "socketpair: clt_sock[%d], ziti_fd[%d]", clt_sock, fds[1]);
 
     rc = dup2(fds[0], clt_sock);
     if (rc == -1) {
@@ -1052,12 +1055,20 @@ void Ziti_lib_shutdown(void) {
 
 static void looper(void *arg) {
     uv_loop_t *l = arg;
+
+    lib_loop = uv_loop_new();
+    ziti_log_init(lib_loop, -1, NULL);
+
     ZITI_LOG(DEBUG, "loop is starting");
-    uv_run(l, UV_RUN_DEFAULT);
+    uv_async_init(lib_loop, &q_async, process_on_loop);
+    uv_sem_post(&lib_sem);
+    uv_run(lib_loop, UV_RUN_DEFAULT);
     ZITI_LOG(DEBUG, "loop is done");
 }
 
 future_t *schedule_on_loop(loop_work_cb cb, void *arg, bool wait) {
+    fprintf(stderr, "scheduling on loop\n");
+
     queue_elem_t *el = calloc(1, sizeof(queue_elem_t));
     el->cb = cb;
     el->arg = arg;
@@ -1068,7 +1079,17 @@ future_t *schedule_on_loop(loop_work_cb cb, void *arg, bool wait) {
     uv_mutex_lock(&q_mut);
     LIST_INSERT_HEAD(&loop_q, el, _next);
     uv_mutex_unlock(&q_mut);
-    uv_async_send(&q_async);
+
+
+    fprintf(stderr, "sending async\n");
+    uv_sem_wait(&lib_sem);
+    int rc = uv_async_send(&q_async);
+    if (rc != 0) {
+        fprintf(stderr, "failed to schedule: %d/%s", rc, uv_strerror(rc));
+    } else {
+        fprintf(stderr, "sent async\n");
+    }
+    uv_sem_post(&lib_sem);
 
     return el->f;
 }
@@ -1106,10 +1127,7 @@ static void child_load_contexts(void *load_list, future_t *f, uv_loop_t *l) {
 }
 
 static void child_init() {
-    lib_loop = uv_loop_new();
     memset(&loop_q, 0, sizeof(loop_q));
-    ziti_log_init(lib_loop, -1, NULL);
-    uv_async_init(lib_loop, &q_async, process_on_loop);
 
     model_map_iter it = model_map_iterator(&ziti_contexts);
     model_list *idents = calloc(1, sizeof(*idents));
@@ -1118,9 +1136,11 @@ static void child_init() {
         model_list_append(idents, strdup(ident));
         it = model_map_it_remove(it);
     }
-
-    child_init_future = schedule_on_loop(child_load_contexts, idents, true);
+    uv_sem_init(&lib_sem, 0);
     uv_thread_create(&lib_thread, looper, lib_loop);
+
+    uv_sem_wait(&lib_sem);
+    child_init_future = schedule_on_loop(child_load_contexts, idents, true);
 }
 
 
@@ -1131,9 +1151,7 @@ static void internal_init() {
     init_in4addr_loopback();
     uv_key_create(&err_key);
     uv_mutex_init(&q_mut);
-    lib_loop = uv_loop_new();
-    ziti_log_init(lib_loop, -1, NULL);
-    uv_async_init(lib_loop, &q_async, process_on_loop);
+    uv_sem_init(&lib_sem, 0);
     uv_thread_create(&lib_thread, looper, lib_loop);
 }
 
